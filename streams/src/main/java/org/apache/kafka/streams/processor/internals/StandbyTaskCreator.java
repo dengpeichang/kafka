@@ -18,11 +18,15 @@ package org.apache.kafka.streams.processor.internals;
 
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.metrics.Sensor;
-import org.apache.kafka.common.utils.LogContext;
+import org.apache.kafka.common.utils.Time;
+import org.apache.kafka.common.utils.internals.LogContext;
 import org.apache.kafka.streams.StreamsConfig;
+import org.apache.kafka.streams.internals.UpgradeFromValues;
 import org.apache.kafka.streams.processor.TaskId;
 import org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl;
 import org.apache.kafka.streams.processor.internals.metrics.ThreadMetrics;
+import org.apache.kafka.streams.state.internals.ThreadCache;
+
 import org.slf4j.Logger;
 
 import java.util.ArrayList;
@@ -31,68 +35,74 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import static org.apache.kafka.streams.internals.StreamsConfigUtils.eosEnabled;
+
 class StandbyTaskCreator {
-    private final InternalTopologyBuilder builder;
-    private final StreamsConfig config;
+    private final TopologyMetadata topologyMetadata;
+    private final StreamsConfig applicationConfig;
     private final StreamsMetricsImpl streamsMetrics;
     private final StateDirectory stateDirectory;
-    private final ChangelogReader storeChangelogReader;
+    private final Time time;
+    private final ThreadCache dummyCache;
     private final Logger log;
     private final Sensor createTaskSensor;
 
-    StandbyTaskCreator(final InternalTopologyBuilder builder,
-                       final StreamsConfig config,
+    StandbyTaskCreator(final TopologyMetadata topologyMetadata,
+                       final StreamsConfig applicationConfig,
                        final StreamsMetricsImpl streamsMetrics,
                        final StateDirectory stateDirectory,
-                       final ChangelogReader storeChangelogReader,
+                       final Time time,
                        final String threadId,
-                       final Logger log) {
-        this.builder = builder;
-        this.config = config;
+                       final LogContext logContext) {
+        this.topologyMetadata = topologyMetadata;
+        this.applicationConfig = applicationConfig;
         this.streamsMetrics = streamsMetrics;
         this.stateDirectory = stateDirectory;
-        this.storeChangelogReader = storeChangelogReader;
-        this.log = log;
+        this.time = time;
+        this.log = logContext.logger(getClass());
+
         createTaskSensor = ThreadMetrics.createTaskSensor(threadId, streamsMetrics);
+
+        dummyCache = new ThreadCache(
+            logContext,
+            0,
+            streamsMetrics
+        );
     }
 
-    Collection<Task> createTasks(final Map<TaskId, Set<TopicPartition>> tasksToBeCreated) {
-        final List<Task> createdTasks = new ArrayList<>();
+    Collection<StandbyTask> createTasks(final Map<TaskId, Set<TopicPartition>> tasksToBeCreated) {
+        final List<StandbyTask> createdTasks = new ArrayList<>();
+
+        final String upgradeFromStr = applicationConfig.getString(StreamsConfig.UPGRADE_FROM_CONFIG);
+        final UpgradeFromValues upgradeFrom = upgradeFromStr != null ? UpgradeFromValues.fromString(upgradeFromStr) : null;
+
         for (final Map.Entry<TaskId, Set<TopicPartition>> newTaskAndPartitions : tasksToBeCreated.entrySet()) {
             final TaskId taskId = newTaskAndPartitions.getKey();
             final Set<TopicPartition> partitions = newTaskAndPartitions.getValue();
-
-            final String threadIdPrefix = String.format("stream-thread [%s] ", Thread.currentThread().getName());
-            final String logPrefix = threadIdPrefix + String.format("%s [%s] ", "standby-task", taskId);
-            final LogContext logContext = new LogContext(logPrefix);
-
-            final ProcessorTopology topology = builder.buildSubtopology(taskId.topicGroupId);
+            final ProcessorTopology topology = topologyMetadata.buildSubtopology(taskId);
 
             if (topology.hasStateWithChangelogs()) {
                 final ProcessorStateManager stateManager = new ProcessorStateManager(
                     taskId,
                     Task.TaskType.STANDBY,
-                    StreamThread.eosEnabled(config),
-                    logContext,
+                    eosEnabled(applicationConfig),
+                    applicationConfig.getBoolean(StreamsConfig.TRANSACTIONAL_STATE_STORES_CONFIG),
+                    getLogContext(taskId),
                     stateDirectory,
-                    storeChangelogReader,
+                    time,
                     topology.storeToChangelogTopic(),
-                    partitions
-                );
-
-                final StandbyTask task = new StandbyTask(
-                    taskId,
                     partitions,
-                    topology,
-                    config,
-                    streamsMetrics,
+                    upgradeFrom);
+
+                final InternalProcessorContext<?, ?> context = new ProcessorContextImpl(
+                    taskId,
+                    applicationConfig,
                     stateManager,
-                    stateDirectory
+                    streamsMetrics,
+                    dummyCache
                 );
 
-                log.trace("Created task {} with assigned partitions {}", taskId, partitions);
-                createdTasks.add(task);
-                createTaskSensor.record();
+                createdTasks.add(createStandbyTask(taskId, partitions, topology, stateManager, context));
             } else {
                 log.trace(
                     "Skipped standby task {} with assigned partitions {} " +
@@ -104,11 +114,62 @@ class StandbyTaskCreator {
         return createdTasks;
     }
 
-    public InternalTopologyBuilder builder() {
-        return builder;
+    /*
+     * TODO: we pass in the new input partitions to validate if they still match,
+     *       in the future we when we have fixed partitions -> tasks mapping,
+     *       we should always reuse the input partition and hence no need validations
+     */
+    StandbyTask createStandbyTaskFromActive(final StreamTask streamTask,
+                                            final Set<TopicPartition> inputPartitions) {
+        if (!inputPartitions.equals(streamTask.inputPartitions)) {
+            log.warn("Detected unmatched input partitions for task {} when recycling it from active to standby", streamTask.id);
+        }
+
+        streamTask.prepareRecycle();
+        streamTask.stateMgr.transitionTaskType(Task.TaskType.STANDBY, getLogContext(streamTask.id));
+
+        final StandbyTask task = new StandbyTask(
+            streamTask.id,
+            inputPartitions,
+            streamTask.topology,
+            streamTask.config,
+            streamsMetrics,
+            streamTask.stateMgr,
+            stateDirectory,
+            dummyCache,
+            streamTask.processorContext
+        );
+
+        log.trace("Created standby task {} from recycled active task with assigned partitions {}", task.id, inputPartitions);
+        createTaskSensor.record();
+        return task;
     }
 
-    public StateDirectory stateDirectory() {
-        return stateDirectory;
+    StandbyTask createStandbyTask(final TaskId taskId,
+                                  final Set<TopicPartition> inputPartitions,
+                                  final ProcessorTopology topology,
+                                  final ProcessorStateManager stateManager,
+                                  final InternalProcessorContext<?, ?> context) {
+        final StandbyTask task = new StandbyTask(
+            taskId,
+            inputPartitions,
+            topology,
+            topologyMetadata.taskConfig(taskId),
+            streamsMetrics,
+            stateManager,
+            stateDirectory,
+            dummyCache,
+            context
+        );
+
+        log.trace("Created standby task {} with assigned partitions {}", taskId, inputPartitions);
+        createTaskSensor.record();
+        return task;
+    }
+
+    private LogContext getLogContext(final TaskId taskId) {
+        final String threadIdPrefix = String.format("stream-thread [%s] ", Thread.currentThread().getName());
+        final String logPrefix = threadIdPrefix + String.format("%s [%s] ", "standby-task", taskId);
+        return new LogContext(logPrefix);
     }
 }

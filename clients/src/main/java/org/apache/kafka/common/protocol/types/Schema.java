@@ -16,6 +16,8 @@
  */
 package org.apache.kafka.common.protocol.types;
 
+import org.apache.kafka.common.protocol.types.Type.DocumentedType;
+
 import java.nio.ByteBuffer;
 import java.util.HashMap;
 import java.util.Map;
@@ -24,11 +26,13 @@ import java.util.Objects;
 /**
  * The schema for a compound record definition
  */
-public class Schema extends Type {
+public class Schema extends DocumentedType {
+    private static final Object[] NO_VALUES = new Object[0];
 
     private final BoundField[] fields;
     private final Map<String, BoundField> fieldsByName;
     private final boolean tolerateMissingFieldsWithDefaults;
+    private final Struct cachedStruct;
 
     /**
      * Construct the schema with a given list of its field values
@@ -51,6 +55,7 @@ public class Schema extends Type {
      *
      * @throws SchemaException If the given list have duplicate fields
      */
+    @SuppressWarnings("this-escape")
     public Schema(boolean tolerateMissingFieldsWithDefaults, Field... fs) {
         this.fields = new BoundField[fs.length];
         this.fieldsByName = new HashMap<>();
@@ -62,6 +67,9 @@ public class Schema extends Type {
             this.fields[i] = new BoundField(def, this, i);
             this.fieldsByName.put(def.name, this.fields[i]);
         }
+        //6 schemas have no fields at the time of this writing (3 versions each of list_groups and api_versions)
+        //for such schemas there's no point in even creating a unique Struct object when deserializing.
+        this.cachedStruct = this.fields.length > 0 ? null : new Struct(this, NO_VALUES);
     }
 
     /**
@@ -90,6 +98,9 @@ public class Schema extends Type {
      */
     @Override
     public Struct read(ByteBuffer buffer) {
+        if (cachedStruct != null) {
+            return cachedStruct;
+        }
         Object[] objects = new Object[fields.length];
         for (int i = 0; i < fields.length; i++) {
             try {
@@ -140,7 +151,7 @@ public class Schema extends Type {
 
     /**
      * Get a field by its slot in the record array
-     * 
+     *
      * @param slot The slot at which this field sits
      * @return The field
      */
@@ -150,7 +161,7 @@ public class Schema extends Type {
 
     /**
      * Get a field by its name
-     * 
+     *
      * @param name The name of the field
      * @return The field
      */
@@ -163,6 +174,20 @@ public class Schema extends Type {
      */
     public BoundField[] fields() {
         return this.fields;
+    }
+
+    protected boolean tolerateMissingFieldsWithDefaults() {
+        return this.tolerateMissingFieldsWithDefaults;
+    }
+
+    @Override
+    public String leftBracket() {
+        return "{";
+    }
+
+    @Override
+    public String rightBracket() {
+        return "}";
     }
 
     /**
@@ -198,6 +223,19 @@ public class Schema extends Type {
         }
     }
 
+    @Override
+    public String typeName() {
+        return "STRUCT";
+    }
+
+    @Override
+    public String documentation() {
+        return "A struct is named by a string with a capitalized first letter and consists of one or more fields. " +
+            "It represents a composite object encoded as the serialization of each field in the order they are defined." + 
+            "In protocol documentation a struct containing multiple fields is enclosed by " + 
+            leftBracket() + " and " + rightBracket() + ".";
+    }
+
     public void walk(Visitor visitor) {
         Objects.requireNonNull(visitor, "visitor must be non-null");
         handleNode(this, visitor);
@@ -220,7 +258,7 @@ public class Schema extends Type {
     /**
      * Override one or more of the visit methods with the desired logic.
      */
-    public static abstract class Visitor {
+    public abstract static class Visitor {
         public void visit(Schema schema) {}
         public void visit(Type field) {}
     }

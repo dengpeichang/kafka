@@ -16,9 +16,11 @@
  */
 package org.apache.kafka.common.serialization;
 
+import org.apache.kafka.common.annotation.InterfaceAudience;
 import org.apache.kafka.common.errors.SerializationException;
 
 import java.io.UnsupportedEncodingException;
+import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.UUID;
 
@@ -26,8 +28,9 @@ import java.util.UUID;
  *  We are converting UUID to String before serializing. String encoding defaults to UTF8 and can be customized by setting
  *  the property key.deserializer.encoding, value.deserializer.encoding or deserializer.encoding. The first two take precedence over the last.
  */
+@InterfaceAudience.Public
 public class UUIDSerializer implements Serializer<UUID> {
-    private String encoding = "UTF8";
+    private String encoding = StandardCharsets.UTF_8.name();
 
     @Override
     public void configure(Map<String, ?> configs, boolean isKey) {

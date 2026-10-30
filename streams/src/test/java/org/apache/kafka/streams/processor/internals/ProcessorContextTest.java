@@ -20,59 +20,56 @@ import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.streams.StreamsConfig;
 import org.apache.kafka.streams.processor.ProcessorContext;
 import org.apache.kafka.streams.processor.TaskId;
+import org.apache.kafka.streams.processor.internals.Task.TaskType;
 import org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl;
 import org.apache.kafka.streams.state.internals.ThreadCache;
-import org.junit.Before;
-import org.junit.Test;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 
-import static org.easymock.EasyMock.expect;
-import static org.easymock.EasyMock.mock;
-import static org.easymock.EasyMock.replay;
-import static org.hamcrest.Matchers.equalTo;
-import static org.hamcrest.MatcherAssert.assertThat;
-import static org.junit.Assert.fail;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.mock;
 
 public class ProcessorContextTest {
     private ProcessorContext context;
 
-    @Before
+    @BeforeEach
     public void prepare() {
         final StreamsConfig streamsConfig = mock(StreamsConfig.class);
-        expect(streamsConfig.getString(StreamsConfig.APPLICATION_ID_CONFIG)).andReturn("add-id");
-        expect(streamsConfig.defaultValueSerde()).andReturn(Serdes.ByteArray());
-        expect(streamsConfig.defaultKeySerde()).andReturn(Serdes.ByteArray());
-        replay(streamsConfig);
+        doReturn("add-id").when(streamsConfig).getString(StreamsConfig.APPLICATION_ID_CONFIG);
+        doReturn(Serdes.ByteArray()).when(streamsConfig).defaultValueSerde();
+        doReturn(Serdes.ByteArray()).when(streamsConfig).defaultKeySerde();
+
+        final ProcessorStateManager stateManager = mock(ProcessorStateManager.class);
+        doReturn(TaskType.ACTIVE).when(stateManager).taskType();
 
         context = new ProcessorContextImpl(
             mock(TaskId.class),
-            mock(StreamTask.class),
             streamsConfig,
-            mock(RecordCollector.class),
-            mock(ProcessorStateManager.class),
+            stateManager,
             mock(StreamsMetricsImpl.class),
             mock(ThreadCache.class)
         );
+        ((InternalProcessorContext) context).transitionToActive(mock(StreamTask.class), null, null);
     }
 
     @Test
     public void shouldNotAllowToScheduleZeroMillisecondPunctuation() {
-        try {
-            context.schedule(Duration.ofMillis(0L), null, null);
-            fail("Should have thrown IllegalArgumentException");
-        } catch (final IllegalArgumentException expected) {
-            assertThat(expected.getMessage(), equalTo("The minimum supported scheduling interval is 1 millisecond."));
-        }
+        final IllegalArgumentException exception = assertThrows(IllegalArgumentException.class,
+            () -> context.schedule(Duration.ofMillis(0L), null, null),
+            "Should have thrown IllegalArgumentException");
+        assertEquals("The minimum supported scheduling interval is 1 millisecond.", exception.getMessage());
     }
 
     @Test
     public void shouldNotAllowToScheduleSubMillisecondPunctuation() {
-        try {
-            context.schedule(Duration.ofNanos(999_999L), null, null);
-            fail("Should have thrown IllegalArgumentException");
-        } catch (final IllegalArgumentException expected) {
-            assertThat(expected.getMessage(), equalTo("The minimum supported scheduling interval is 1 millisecond."));
-        }
+        final IllegalArgumentException exception = assertThrows(IllegalArgumentException.class,
+            () -> context.schedule(Duration.ofNanos(999_999L), null, null),
+            "Should have thrown IllegalArgumentException");
+        assertEquals("The minimum supported scheduling interval is 1 millisecond.", exception.getMessage());
     }
 }
